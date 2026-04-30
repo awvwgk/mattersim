@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Potential
 """
@@ -26,7 +25,6 @@ from torchmetrics import MeanMetric
 
 from mattersim.datasets.utils.build import build_dataloader
 from mattersim.forcefield.m3gnet.m3gnet import M3Gnet
-from mattersim.jit_compile_tools.jit import compile_mode
 from mattersim.utils.download_utils import download_checkpoint
 from mattersim.utils.logger_utils import get_logger
 
@@ -34,7 +32,6 @@ rank = int(os.getenv("RANK", 0))
 logger = get_logger()
 
 
-@compile_mode("script")
 class Potential(nn.Module):
     """
     A wrapper class for the force field model
@@ -107,6 +104,29 @@ class Potential(nn.Module):
         self.rank = None
 
         self.use_finetune_label_loss = kwargs.get("use_finetune_label_loss", False)
+        self.version = kwargs.get("version", "")
+
+    def enable_gradient_checkpointing(self, enable: bool = True):
+        """Enable gradient checkpointing for memory-efficient inference on
+        large systems.
+
+        When enabled, intermediate activations are recomputed during the
+        backward pass instead of being stored, reducing memory usage by ~50%
+        at the cost of ~30% slower computation.
+
+        For very large systems (>50k atoms), this can enable successful
+        execution that would otherwise OOM.
+
+        Args:
+            enable: Whether to enable gradient checkpointing. Default True.
+        """
+        if hasattr(self.model, "enable_gradient_checkpointing"):
+            self.model.enable_gradient_checkpointing(enable)
+        else:
+            logger.warning(
+                f"Model {self.model_name} does not support "
+                "gradient checkpointing"
+            )
 
     def freeze_reset_model(
         self,
@@ -744,80 +764,112 @@ class Potential(nn.Module):
         if self.model_name == "graphormer" or self.model_name == "geomformer":
             raise NotImplementedError
         else:
-            strain = torch.zeros_like(input["cell"], device=self.device)
+            # AOTI fast path: energy/forces/stresses already computed in the
+            # compiled artifact — skip strain setup and autograd.
+            if getattr(self.model, "_is_aoti", False):
+                if include_forces and not getattr(
+                    self.model, "include_forces", True
+                ):
+                    raise RuntimeError(
+                        "Forces were requested but the AOTI-compiled model "
+                        "was built with include_forces=False. Recompile with "
+                        "include_forces=True or use the eager model."
+                    )
+                if include_stresses and not getattr(
+                    self.model, "include_stresses", True
+                ):
+                    raise RuntimeError(
+                        "Stresses were requested but the AOTI-compiled model "
+                        "was built with include_stresses=False. Recompile "
+                        "with include_stresses=True or use the eager model."
+                    )
+                result = self.model.forward(input, dataset_idx)
+                output["energies"] = output["total_energy"] = result["total_energy"]
+                if include_forces:
+                    output["forces"] = result["forces"]
+                if include_stresses:
+                    output["stresses"] = result["stresses"]
+                return output
+
+            # Save reference to original tensor before any reassignment
+            original_atom_pos = input["atom_pos"]
+            original_pos_requires_grad = original_atom_pos.requires_grad
+            strain = torch.zeros_like(input["cell"])
             volume = torch.linalg.det(input["cell"])
-            if include_forces is True:
-                input["atom_pos"].requires_grad_(True)
-            if include_stresses is True:
-                strain.requires_grad_(True)
-                input["cell"] = torch.matmul(
-                    input["cell"],
-                    (torch.eye(3, device=self.device)[None, ...] + strain),
-                )
-                strain_augment = strain[input["batch"]]
-                input["atom_pos"] = torch.einsum(
-                    "bi, bij -> bj",
-                    input["atom_pos"],
-                    (torch.eye(3, device=self.device)[None, ...] + strain_augment),
-                )
-                volume = torch.linalg.det(input["cell"])
-
-            energies = self.model.forward(input, dataset_idx)
-            output["total_energy"] = energies
-
-            # Only take first derivative if only force is required
-            if include_forces is True and include_stresses is False:
-                grad_outputs: List[Optional[torch.Tensor]] = [
-                    torch.ones_like(
-                        energies,
+            try:
+                if include_forces is True:
+                    input["atom_pos"].requires_grad_(True)
+                if include_stresses is True:
+                    strain.requires_grad_(True)
+                    input["cell"] = torch.matmul(
+                        input["cell"],
+                        (torch.eye(3, device=self.device)[None, ...] + strain),
                     )
-                ]
-                grad = torch.autograd.grad(
-                    outputs=[
-                        energies,
-                    ],
-                    inputs=[input["atom_pos"]],
-                    grad_outputs=grad_outputs,
-                    create_graph=self.model.training,
-                )
-
-                # Dump out gradient for forces
-                force_grad = grad[0]
-                if force_grad is not None:
-                    forces = torch.neg(force_grad)
-                    output["forces"] = forces
-
-            # Take derivatives up to second order
-            # if both forces and stresses are required
-            if include_forces is True and include_stresses is True:
-                grad_outputs: List[Optional[torch.Tensor]] = [
-                    torch.ones_like(
-                        energies,
+                    strain_augment = strain[input["batch"]]
+                    input["atom_pos"] = torch.einsum(
+                        "bi, bij -> bj",
+                        input["atom_pos"],
+                        (torch.eye(3, device=self.device)[None, ...] + strain_augment),
                     )
-                ]
-                grad = torch.autograd.grad(
-                    outputs=[
-                        energies,
-                    ],
-                    inputs=[input["atom_pos"], strain],
-                    grad_outputs=grad_outputs,
-                    create_graph=self.model.training,
-                )
+                    volume = torch.linalg.det(input["cell"])
 
-                # Dump out gradient for forces and stresses
-                force_grad = grad[0]
-                stress_grad = grad[1]
+                energies = self.model.forward(input, dataset_idx)
+                output["energies"] = output["total_energy"] = energies
 
-                if force_grad is not None:
-                    forces = torch.neg(force_grad)
-                    output["forces"] = forces
+                grad_outputs: List[Optional[torch.Tensor]] = []
+                # Only take first derivative if only force is required
+                if include_forces is True and include_stresses is False:
+                    grad_outputs = [
+                        torch.ones_like(
+                            energies,
+                        )
+                    ]
+                    grad = torch.autograd.grad(
+                        outputs=[
+                            energies,
+                        ],
+                        inputs=[input["atom_pos"]],
+                        grad_outputs=grad_outputs,
+                        create_graph=self.model.training,
+                    )
 
-                if stress_grad is not None:
-                    stresses = (
-                        1 / volume[:, None, None] * stress_grad / GPa
-                    )  # 1/GPa = 160.21766208
-                    output["stresses"] = stresses
+                    # Dump out gradient for forces
+                    force_grad = grad[0]
+                    if force_grad is not None:
+                        forces = torch.neg(force_grad)
+                        output["forces"] = forces
 
+                # Take derivatives up to second order
+                # if both forces and stresses are required
+                if include_forces is True and include_stresses is True:
+                    grad_outputs = [
+                        torch.ones_like(
+                            energies,
+                        )
+                    ]
+                    grad = torch.autograd.grad(
+                        outputs=[
+                            energies,
+                        ],
+                        inputs=[input["atom_pos"], strain],
+                        grad_outputs=grad_outputs,
+                        create_graph=self.model.training,
+                    )
+
+                    # Dump out gradient for forces and stresses
+                    force_grad = grad[0]
+                    stress_grad = grad[1]
+
+                    if force_grad is not None:
+                        forces = torch.neg(force_grad)
+                        output["forces"] = forces
+
+                    if stress_grad is not None:
+                        stresses = 1 / volume[:, None, None] * stress_grad / GPa
+                        output["stresses"] = stresses
+            finally:
+                # Reset requires_grad to avoid side effects across calls
+                original_atom_pos.requires_grad_(original_pos_requires_grad)
         return output
 
     def save(self, save_path):
@@ -1071,59 +1123,34 @@ class Potential(nn.Module):
 
 def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
     if model_type == "m3gnet":
-        # TODO: key_list
-        # Precompute scalar sums on CPU before moving tensors to device,
-        # to avoid device-to-host sync when calling int() on MPS/CUDA tensors.
-        total_num_atoms = int(graph_batch.num_atoms.sum())
-        total_num_bonds = int(graph_batch.num_bonds.sum())
+        if not torch.cuda.is_available() and device != "cpu":
+            if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+                device = "cpu"
+        target_device = torch.device(device)
+        src_device = graph_batch.atom_pos.device
+        already_on_device = src_device.type == target_device.type
 
-        atom_pos = graph_batch.atom_pos.to(device)
-        cell = graph_batch.cell.to(device)
-        pbc_offsets = graph_batch.pbc_offsets.to(device)
-        atom_attr = graph_batch.atom_attr.to(device)
-        edge_index = graph_batch.edge_index.to(device)
-        three_body_indices = graph_batch.three_body_indices.to(device)
-        num_three_body = graph_batch.num_three_body.to(device)
-        num_bonds = graph_batch.num_bonds.to(device)
-        num_triple_ij = graph_batch.num_triple_ij.to(device)
-        num_atoms = graph_batch.num_atoms.to(device)
+        def _move(t):
+            if t is None:
+                return t
+            return t if already_on_device else t.to(target_device)
+
         num_graphs = graph_batch.num_graphs
-        num_graphs = torch.tensor(num_graphs, device=device)
-        batch = graph_batch.batch.to(device)
 
-        # Resemble input dictionary
-        input = {}
-        input["atom_pos"] = atom_pos
-        input["cell"] = cell
-        input["pbc_offsets"] = pbc_offsets
-        input["atom_attr"] = atom_attr
-        input["edge_index"] = edge_index
-        input["three_body_indices"] = three_body_indices
-        input["num_three_body"] = num_three_body
-        input["num_bonds"] = num_bonds
-        input["num_triple_ij"] = num_triple_ij
-        input["num_atoms"] = num_atoms
-        input["num_graphs"] = num_graphs
-        input["batch"] = batch
-
-        # Precomputed derived values to avoid device-to-host sync on MPS/CUDA.
-        input["total_num_atoms"] = total_num_atoms
-        input["total_num_bonds"] = total_num_bonds
-
-        # Bond index bias for three-body offset computation
-        # (replaces repeat_interleave(cumsum, num_three_body) in m3gnet.py)
-        cumsum = torch.cumsum(num_bonds, dim=0) - num_bonds
-        input["bond_index_bias"] = torch.repeat_interleave(
-            cumsum, num_three_body, dim=0
-        ).unsqueeze(-1)
-
-        # Edge-to-three-body map for scatter in ThreeDInteraction
-        # (replaces repeat_interleave(arange, num_triple_ij) in message_passing.py)
-        total_bonds = input["total_num_bonds"]
-        index_map = torch.arange(total_bonds, device=num_triple_ij.device)
-        input["three_body_edge_map"] = torch.repeat_interleave(
-            index_map, num_triple_ij.view(-1)
-        )
+        input = {
+            "atom_pos": _move(graph_batch.atom_pos),
+            "cell": _move(graph_batch.cell),
+            "pbc_offsets": _move(graph_batch.pbc_offsets),
+            "atom_attr": _move(graph_batch.atom_attr),
+            "edge_index": _move(graph_batch.edge_index),
+            "three_body_indices": _move(graph_batch.three_body_indices),
+            "num_three_body": _move(graph_batch.num_three_body),
+            "num_bonds": _move(graph_batch.num_bonds),
+            "num_triple_ij": _move(graph_batch.num_triple_ij),
+            "num_atoms": _move(graph_batch.num_atoms),
+            "num_graphs": torch.tensor(num_graphs, device=device),
+            "batch": _move(graph_batch.batch),
+        }
 
     elif model_type == "graphormer" or model_type == "geomformer":
         raise NotImplementedError
@@ -1147,6 +1174,9 @@ class MatterSimCalculator(Calculator):
         compute_stress: bool = True,
         stress_weight: float = GPa,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        batch_converter: bool = False,
+        direct_graph: bool = False,
+        compile: bool = False,
         **kwargs,
     ):
         """
@@ -1154,6 +1184,15 @@ class MatterSimCalculator(Calculator):
             potential (Potential): m3gnet.models.Potential
             compute_stress (bool): whether to calculate the stress
             stress_weight (float): the stress weight.
+            batch_converter (bool): use GPU-accelerated graph construction
+                (via BatchGraphConverter). Slower than ``direct_graph=True``
+                for single structures because of PyG overhead.
+            direct_graph (bool): use direct tensor graph construction (no
+                PyG). Useful with AOTI-compiled models that are already
+                optimized and don't need ``torch.compile``.
+            compile (bool): apply ``torch.compile`` to the model forward
+                pass. Implies ``direct_graph=True``. First call has ~5s
+                warmup, then cached for the session.
             **kwargs:
         """
         super().__init__(**kwargs)
@@ -1165,6 +1204,17 @@ class MatterSimCalculator(Calculator):
         self.stress_weight = stress_weight
         self.args_dict = args_dict
         self.device = device
+        self.batch_converter = batch_converter
+        self._use_direct_graph = direct_graph or compile
+        self._compiled = False
+
+        if compile and self.potential.model_name == "m3gnet":
+            import torch._inductor.config
+            torch._inductor.config.fx_graph_cache = True
+            self.potential.model.forward = torch.compile(
+                self.potential.model.forward,
+            )
+            self._compiled = True
 
     def __getstate__(self):
         """Prepare state for pickling by stripping non-picklable training
@@ -1237,16 +1287,6 @@ class MatterSimCalculator(Calculator):
         properties: Optional[list] = None,
         system_changes: Optional[list] = None,
     ):
-        """
-        Args:
-            atoms (ase.Atoms): ase Atoms object
-            properties (list): list of properties to calculate
-            system_changes (list): monitor which properties of atoms were
-                changed for new calculation. If not, the previous calculation
-                results will be loaded.
-        Returns:
-        """
-
         all_changes = [
             "positions",
             "numbers",
@@ -1262,8 +1302,6 @@ class MatterSimCalculator(Calculator):
             atoms=atoms, properties=properties, system_changes=system_changes
         )
 
-        self.args_dict["batch_size"] = 1
-        self.args_dict["only_inference"] = 1
         cutoff = (
             self.potential.model.model_args["cutoff"]
             if self.potential.model_name == "m3gnet"
@@ -1275,40 +1313,74 @@ class MatterSimCalculator(Calculator):
             else 4.0
         )
 
-        dataloader = build_dataloader(
-            [atoms],
-            model_type=self.potential.model_name,
-            cutoff=cutoff,
-            threebody_cutoff=threebody_cutoff,
-            **self.args_dict,
-        )
-        for graph_batch in dataloader:
-            # Resemble input dictionary
-            if (
-                self.potential.model_name == "graphormer"
-                or self.potential.model_name == "geomformer"
-            ):
-                raise NotImplementedError
-            else:
-                input = batch_to_dict(graph_batch, device=self.device)
-            result = self.potential.forward(
-                input, include_forces=True, include_stresses=self.compute_stress
+        if self._use_direct_graph and self.potential.model_name == "m3gnet":
+            # Direct tensor path: ASE Atoms → tensors → GPU graph → model
+            input = self._build_graph_direct(atoms, cutoff, threebody_cutoff)
+        else:
+            # Legacy path: ASE Atoms → PyG Data → DataLoader → batch_to_dict
+            self.args_dict["batch_size"] = 1
+            self.args_dict["only_inference"] = 1
+            dataloader = build_dataloader(
+                [atoms],
+                model_type=self.potential.model_name,
+                cutoff=cutoff,
+                threebody_cutoff=threebody_cutoff,
+                batch_converter=self.batch_converter,
+                **self.args_dict,
             )
-            if (
-                self.potential.model_name == "graphormer"
-                or self.potential.model_name == "geomformer"
-            ):
-                raise NotImplementedError
-            else:
-                self.results.update(
-                    energy=result["total_energy"].detach().cpu().numpy()[0],
-                    free_energy=result["total_energy"].detach().cpu().numpy()[0],
-                    forces=result["forces"].detach().cpu().numpy(),
+            graph_batch = next(iter(dataloader))
+            input = batch_to_dict(graph_batch, device=self.device)
+
+        result = self.potential.forward(
+            input, include_forces=True, include_stresses=self.compute_stress
+        )
+        self.results.update(
+            energy=result["total_energy"].detach().cpu().numpy()[0],
+            free_energy=result["total_energy"].detach().cpu().numpy()[0],
+            forces=result["forces"].detach().cpu().numpy(),
+        )
+        if self.compute_stress:
+            self.results.update(
+                stress=self.stress_weight
+                * full_3x3_to_voigt_6_stress(
+                    result["stresses"].detach().cpu().numpy()[0]
                 )
-            if self.compute_stress:
-                self.results.update(
-                    stress=self.stress_weight
-                    * full_3x3_to_voigt_6_stress(
-                        result["stresses"].detach().cpu().numpy()[0]
-                    )
-                )
+            )
+
+    def _build_graph_direct(
+        self, atoms: Atoms, cutoff: float, threebody_cutoff: float,
+    ) -> Dict[str, torch.Tensor]:
+        """Build model input dict directly from ASE Atoms, no PyG."""
+        from mattersim.datasets.utils.converter import (
+            _normalize_atoms,
+            create_batch_graph_dict,
+        )
+
+        atoms = _normalize_atoms(atoms, cutoff, threebody_cutoff)
+        device = self.device
+
+        pos = torch.tensor(
+            atoms.get_positions(), dtype=torch.float32, device=device,
+        )
+        cell = torch.tensor(
+            np.array(atoms.cell), dtype=torch.float32, device=device,
+        ).unsqueeze(0)
+        atomic_numbers = torch.tensor(
+            atoms.get_atomic_numbers(), dtype=torch.long, device=device,
+        )
+        num_atoms = torch.tensor(
+            [len(atoms)], dtype=torch.long, device=device,
+        )
+        pbc = torch.tensor(
+            np.array(atoms.pbc, dtype=bool), dtype=torch.bool, device=device,
+        ).unsqueeze(0)
+
+        return create_batch_graph_dict(
+            pos=pos,
+            cell=cell,
+            atomic_numbers=atomic_numbers,
+            num_atoms=num_atoms,
+            twobody_cutoff=cutoff,
+            threebody_cutoff=threebody_cutoff,
+            pbc=pbc,
+        )

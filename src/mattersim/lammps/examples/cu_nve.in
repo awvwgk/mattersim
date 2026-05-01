@@ -1,0 +1,40 @@
+# MatterSim Cu NVE: 4x4x4 FCC supercell (256 atoms), 100 steps
+#
+# Run via: python ../lmp.py cu_nve.in
+# Validate: python validate.py
+
+units           metal
+atom_style      atomic
+boundary        p p p
+
+# Kokkos requires half neighbor lists and newton on for pair_style mliap
+newton          on
+
+lattice         fcc 3.615
+region          box block 0 4 0 4 0 4
+create_box      1 box
+create_atoms    1 box
+
+mass            1 63.546
+
+pair_style      mliap unified ${MODEL_PATH}
+pair_coeff      * * Cu
+
+velocity        all create 300.0 12345
+
+fix             1 all nve
+timestep        0.002
+
+thermo          10
+thermo_style    custom step temp pe ke etotal press
+
+dump            traj all custom 20 dump.lammpstrj id type x y z fx fy fz
+dump_modify     traj sort id format float %20.12g
+
+fix             eout all print 20 "$(step) $(pe)" file pe.dat screen no title "# step pe"
+compute         vpress all pressure NULL virial
+fix             sout all print 20 &
+                "$(step) $(c_vpress[1]) $(c_vpress[2]) $(c_vpress[3]) $(c_vpress[4]) $(c_vpress[5]) $(c_vpress[6])" &
+                file stress.dat screen no title "# step pxx pyy pzz pxy pxz pyz"
+
+run             100

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 
-from mattersim.datasets.utils.threebody_indices_torch import compute_threebody_torch
+from mattersim.datasets.utils.converter import compute_threebody_indices_torch
 
 
 def build_m3gnet_input_from_lammps(
@@ -94,8 +94,8 @@ def build_m3gnet_input_from_lammps(
         n_triple_ij,
         _n_triple_i,
         n_triple_s,
-    ) = _compute_threebody_with_cutoff(
-        edge_indices=edge_index.T,  # [n_edges, 2]
+    ) = compute_threebody_indices_torch(
+        edge_indices=edge_index,
         distances=distances_sorted,
         num_atoms=num_atoms,
         threebody_cutoff=threebody_cutoff,
@@ -117,71 +117,3 @@ def build_m3gnet_input_from_lammps(
         "_sort_idx": sort_idx,
         "_edge_mask": edge_mask,
     }
-
-
-def _compute_threebody_with_cutoff(
-    edge_indices: torch.Tensor,
-    distances: torch.Tensor,
-    num_atoms: torch.Tensor,
-    threebody_cutoff: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute three-body indices with distance-based filtering.
-
-    Mirrors the logic in converter.py:compute_threebody_indices_torch but
-    operates on a single structure.
-
-    Args:
-        edge_indices: [n_edges, 2] sorted by first column (central atom).
-        distances: [n_edges] edge lengths.
-        num_atoms: [1] number of atoms (single structure).
-        threebody_cutoff: Distance cutoff for three-body interactions.
-
-    Returns:
-        triple_bond_indices, n_triple_ij, n_triple_i, n_triple_s
-    """
-    num_edges = edge_indices.shape[0]
-    device = edge_indices.device
-
-    if num_edges > 0 and threebody_cutoff is not None:
-        valid_mask = distances <= threebody_cutoff
-        ij_reverse_map = torch.where(valid_mask)[0]
-        original_index = torch.arange(num_edges, device=device)[valid_mask]
-        valid_edge_indices = edge_indices[valid_mask]
-    else:
-        ij_reverse_map = None
-        original_index = torch.arange(num_edges, device=device)
-        valid_edge_indices = edge_indices
-
-    if num_edges > 0 and valid_edge_indices.shape[0] > 0:
-        (
-            angle_indices,
-            num_angles_per_edge,
-            _num_edges_per_atom,
-            num_angles_per_structure,
-        ) = compute_threebody_torch(valid_edge_indices, num_atoms)
-
-        if ij_reverse_map is not None:
-            num_angles_per_edge_full = torch.zeros(
-                num_edges, dtype=torch.long, device=device
-            )
-            num_angles_per_edge_full[ij_reverse_map] = num_angles_per_edge
-            num_angles_per_edge = num_angles_per_edge_full
-
-        # Map filtered indices back to original edge indices
-        angle_indices = original_index[angle_indices]
-    else:
-        angle_indices = torch.zeros((0, 2), dtype=torch.long, device=device)
-        num_angles_per_edge = torch.zeros(num_edges, dtype=torch.int32, device=device)
-        _num_edges_per_atom = torch.zeros(
-            int(num_atoms.sum().item()), dtype=torch.int32, device=device
-        )
-        num_angles_per_structure = torch.zeros(
-            num_atoms.shape[0], dtype=torch.int32, device=device
-        )
-
-    return (
-        angle_indices,
-        num_angles_per_edge,
-        _num_edges_per_atom,
-        num_angles_per_structure,
-    )

@@ -1176,6 +1176,7 @@ class MatterSimCalculator(Calculator):
         batch_converter: bool = False,
         direct_graph: bool = False,
         compile: bool = False,
+        dtype: str = "float32",
         **kwargs,
     ):
         """
@@ -1192,9 +1193,30 @@ class MatterSimCalculator(Calculator):
             compile (bool): apply ``torch.compile`` to the model forward
                 pass. Implies ``direct_graph=True``. First call has ~5s
                 warmup, then cached for the session.
+            dtype (str): floating point precision for inference.
+                ``"float32"`` (default) or ``"float64"`` for double
+                precision. Double precision improves numerical stability
+                for sensitive properties like thermal conductivity.
+                Note: MPS devices do not support float64.
             **kwargs:
         """
         super().__init__(**kwargs)
+
+        # Validate dtype early, before loading the model
+        _dtype_map = {
+            "float32": torch.float32,
+            "float64": torch.float64,
+        }
+        if dtype not in _dtype_map:
+            raise ValueError(
+                f"Unsupported dtype: {dtype!r}. Use 'float32' or 'float64'."
+            )
+        self.dtype = _dtype_map[dtype]
+        if self.dtype == torch.float64 and torch.device(device).type == "mps":
+            raise ValueError(
+                "MPS does not support float64. Use dtype='float32' on MPS devices."
+            )
+
         if potential is None:
             self.potential = Potential.from_checkpoint(device=device, **kwargs)
         else:
@@ -1207,10 +1229,13 @@ class MatterSimCalculator(Calculator):
         self._use_direct_graph = direct_graph or compile
         self._compiled = False
 
-        if compile and self.potential.model_name == "m3gnet":
-            import torch._inductor.config
+        if self.dtype == torch.float64:
+            self.potential.model.double()
 
-            torch._inductor.config.fx_graph_cache = True
+        if compile and self.potential.model_name == "m3gnet":
+            import torch._inductor.config as inductor_config
+
+            inductor_config.fx_graph_cache = True
             self.potential.model.forward = torch.compile(
                 self.potential.model.forward,
             )
@@ -1235,9 +1260,13 @@ class MatterSimCalculator(Calculator):
         model_args = state.pop("_model_args")
         model_name = state.pop("_model_name")
         self.__dict__.update(state)
+        if "dtype" not in self.__dict__:
+            self.dtype = torch.float32
 
         # Rebuild potential for inference only
         self.potential = Potential.from_checkpoint(device=self.device)
+        if self.dtype == torch.float64:
+            self.potential.model.double()
         self.potential.model.load_state_dict(model_state_dict)
         self.potential.model.eval()
 
@@ -1331,6 +1360,12 @@ class MatterSimCalculator(Calculator):
             graph_batch = next(iter(dataloader))
             input = batch_to_dict(graph_batch, device=self.device)
 
+        # Upcast float tensors to match model dtype (e.g. float64)
+        if self.dtype != torch.float32:
+            for k, v in input.items():
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    input[k] = v.to(self.dtype)
+
         result = self.potential.forward(
             input, include_forces=True, include_stresses=self.compute_stress
         )
@@ -1364,12 +1399,12 @@ class MatterSimCalculator(Calculator):
 
         pos = torch.tensor(
             atoms.get_positions(),
-            dtype=torch.float32,
+            dtype=self.dtype,
             device=device,
         )
         cell = torch.tensor(
             np.array(atoms.cell),
-            dtype=torch.float32,
+            dtype=self.dtype,
             device=device,
         ).unsqueeze(0)
         atomic_numbers = torch.tensor(

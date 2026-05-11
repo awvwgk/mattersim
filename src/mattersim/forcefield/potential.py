@@ -124,8 +124,7 @@ class Potential(nn.Module):
             self.model.enable_gradient_checkpointing(enable)
         else:
             logger.warning(
-                f"Model {self.model_name} does not support "
-                "gradient checkpointing"
+                f"Model {self.model_name} does not support " "gradient checkpointing"
             )
 
     def freeze_reset_model(
@@ -767,9 +766,7 @@ class Potential(nn.Module):
             # AOTI fast path: energy/forces/stresses already computed in the
             # compiled artifact — skip strain setup and autograd.
             if getattr(self.model, "_is_aoti", False):
-                if include_forces and not getattr(
-                    self.model, "include_forces", True
-                ):
+                if include_forces and not getattr(self.model, "include_forces", True):
                     raise RuntimeError(
                         "Forces were requested but the AOTI-compiled model "
                         "was built with include_forces=False. Recompile with "
@@ -1124,7 +1121,9 @@ class Potential(nn.Module):
 def batch_to_dict(graph_batch, model_type="m3gnet", device="cuda"):
     if model_type == "m3gnet":
         if not torch.cuda.is_available() and device != "cpu":
-            if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            if not (
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            ):
                 device = "cpu"
         target_device = torch.device(device)
         src_device = graph_batch.atom_pos.device
@@ -1210,6 +1209,7 @@ class MatterSimCalculator(Calculator):
 
         if compile and self.potential.model_name == "m3gnet":
             import torch._inductor.config
+
             torch._inductor.config.fx_graph_cache = True
             self.potential.model.forward = torch.compile(
                 self.potential.model.forward,
@@ -1348,7 +1348,10 @@ class MatterSimCalculator(Calculator):
             )
 
     def _build_graph_direct(
-        self, atoms: Atoms, cutoff: float, threebody_cutoff: float,
+        self,
+        atoms: Atoms,
+        cutoff: float,
+        threebody_cutoff: float,
     ) -> Dict[str, torch.Tensor]:
         """Build model input dict directly from ASE Atoms, no PyG."""
         from mattersim.datasets.utils.converter import (
@@ -1360,19 +1363,29 @@ class MatterSimCalculator(Calculator):
         device = self.device
 
         pos = torch.tensor(
-            atoms.get_positions(), dtype=torch.float32, device=device,
+            atoms.get_positions(),
+            dtype=torch.float32,
+            device=device,
         )
         cell = torch.tensor(
-            np.array(atoms.cell), dtype=torch.float32, device=device,
+            np.array(atoms.cell),
+            dtype=torch.float32,
+            device=device,
         ).unsqueeze(0)
         atomic_numbers = torch.tensor(
-            atoms.get_atomic_numbers(), dtype=torch.long, device=device,
+            atoms.get_atomic_numbers(),
+            dtype=torch.long,
+            device=device,
         )
         num_atoms = torch.tensor(
-            [len(atoms)], dtype=torch.long, device=device,
+            [len(atoms)],
+            dtype=torch.long,
+            device=device,
         )
         pbc = torch.tensor(
-            np.array(atoms.pbc, dtype=bool), dtype=torch.bool, device=device,
+            np.array(atoms.pbc, dtype=bool),
+            dtype=torch.bool,
+            device=device,
         ).unsqueeze(0)
 
         return create_batch_graph_dict(

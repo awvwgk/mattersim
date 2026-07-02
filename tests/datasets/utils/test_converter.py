@@ -4,9 +4,12 @@ which requires int64 but receives platform-dependent C long on Windows.
 """
 
 import numpy as np
+import torch
+from torch_geometric.data import Batch
 
 from mattersim.datasets.utils.converter import (
     GraphConverter,
+    M3GNetData,
     get_fixed_radius_bonding,
 )
 
@@ -43,8 +46,28 @@ class TestGraphConverter:
         converter = GraphConverter(model_type="m3gnet")
         graph = converter.convert(si_diamond)
         assert graph is not None
+        assert isinstance(graph, M3GNetData)
         assert hasattr(graph, "edge_index")
         assert hasattr(graph, "atom_pos")
+
+    def test_three_body_indices_are_offset_when_batched(self, si_diamond):
+        """PyG batches should offset three_body_indices by prior num_bonds."""
+        converter = GraphConverter(model_type="m3gnet")
+        graph0 = converter.convert(si_diamond)
+        graph1 = converter.convert(si_diamond.copy())
+
+        assert graph0.num_three_body > 0
+        assert graph1.num_three_body > 0
+
+        batch = Batch.from_data_list([graph0, graph1])
+        first_graph_triples = int(graph0.num_three_body)
+        second_graph_triples = int(graph1.num_three_body)
+        batched_second_indices = batch.three_body_indices[
+            first_graph_triples : first_graph_triples + second_graph_triples
+        ]
+        expected_second_indices = graph1.three_body_indices + graph0.num_bonds
+
+        assert torch.equal(batched_second_indices, expected_second_indices)
 
     def test_non_periodic_structure_converts(self, water_molecule):
         """Non-periodic molecule should convert (with auto-supercell)

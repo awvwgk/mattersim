@@ -268,7 +268,7 @@ class GraphConverter:
                 args["forces"] = torch.FloatTensor(forces)
             if stress is not None:
                 args["stress"] = torch.FloatTensor(stress).unsqueeze(0)
-            return Data(**args)
+            return M3GNetData(**args)
 
         elif self.model_type == "graphormer":
             raise NotImplementedError

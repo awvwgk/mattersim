@@ -186,6 +186,85 @@ def test_model_fingerprint_tracks_weights_and_config(mattersim_potential_cpu):
         model.model_args["cutoff"] = original_cutoff
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_mps_model_stage_diagnostics(si_diamond, perturb):
+    """Temporarily locate the first CPU/MPS model divergence."""
+    import platform
+
+    from mattersim.forcefield.potential import Potential, batch_to_dict
+
+    atoms = perturb(si_diamond, displacement=0.05)
+    cpu_potential = Potential.from_checkpoint(device="cpu", load_training_state=False)
+    mps_potential = Potential.from_checkpoint(device="mps", load_training_state=False)
+    model_args = cpu_potential.model.model_args
+    dataloader = build_dataloader(
+        [atoms],
+        batch_size=1,
+        model_type="m3gnet",
+        shuffle=False,
+        only_inference=True,
+        cutoff=model_args["cutoff"],
+        threebody_cutoff=model_args["threebody_cutoff"],
+    )
+    graph_batch = next(iter(dataloader))
+    inputs = {
+        "cpu": batch_to_dict(graph_batch, model_type="m3gnet", device="cpu"),
+        "mps": batch_to_dict(graph_batch, model_type="m3gnet", device="mps"),
+    }
+    targets = {
+        "atom_embedding",
+        "rbf",
+        "edge_encoder",
+        "sbf",
+        "graph_conv.0",
+        "graph_conv.1",
+        "graph_conv.2",
+        "final",
+        "normalizer",
+    }
+
+    def flatten_tensors(value):
+        if isinstance(value, torch.Tensor):
+            return [value.detach().cpu().reshape(-1)]
+        if isinstance(value, (tuple, list)):
+            return [tensor for item in value for tensor in flatten_tensors(item)]
+        return []
+
+    def run_and_capture(model, input_dict):
+        captured = {}
+        handles = []
+        for name, module in model.named_modules():
+            if name in targets:
+                handles.append(
+                    module.register_forward_hook(
+                        lambda _module, _args, output, name=name: captured.update(
+                            {name: torch.cat(flatten_tensors(output))}
+                        )
+                    )
+                )
+        try:
+            energy = model(input_dict).detach().cpu()
+        finally:
+            for handle in handles:
+                handle.remove()
+        return energy, captured
+
+    cpu_energy, cpu_stages = run_and_capture(cpu_potential.model, inputs["cpu"])
+    mps_energy, mps_stages = run_and_capture(mps_potential.model, inputs["mps"])
+    stage_diffs = {
+        name: float((cpu_stages[name] - mps_stages[name]).abs().max())
+        for name in targets
+    }
+    report = {
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "cpu_energy": cpu_energy.tolist(),
+        "mps_energy": mps_energy.tolist(),
+        "stage_max_abs": stage_diffs,
+    }
+    pytest.fail(f"MPS stage diagnostic: {report}")
+
+
 @requires_gpu
 class TestAOTIMatchesEager:
     """AOTI-vs-eager numeric parity across three-body counts.

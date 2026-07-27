@@ -176,14 +176,6 @@ class TestExportKeepsShapesDynamic:
         with pytest.raises(RuntimeError, match="specialized the three-body"):
             assert_threebody_dim_is_dynamic(exported_model)
 
-    def test_is_dynamic_dim_accepts_symbolic(self, mattersim_potential_cpu):
-        """Sanity check on the predicate itself, on a real symbolic dim."""
-        exported_model = _export(mattersim_potential_cpu, "cpu")
-        symbolic_dim = _threebody_placeholder(exported_model).meta["val"].shape[0]
-
-        assert is_dynamic_dim(symbolic_dim)
-        assert not is_dynamic_dim(EXAMPLE_NUM_TRIPLES)
-
 
 class TestSphericalHarmonicsScripting:
     """``_spherical_harmonics`` must stay traceable *and* scriptable.

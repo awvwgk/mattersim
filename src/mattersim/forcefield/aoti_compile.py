@@ -115,6 +115,7 @@ _EDGE_DIM = Dim("num_edges", min=1)
 # Named (rather than ``Dim.AUTO``) on purpose: ``Dim.AUTO`` silently accepts a
 # specialization guard, so an op that materializes the three-body count would
 # bake the compile-time value into the artifact instead of failing the export.
+# Paired with assert_threebody_dim_is_dynamic(), which backstops this spec.
 _THREEBODY_DIM = Dim("num_triples", min=1)
 
 MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
@@ -291,6 +292,14 @@ def assert_threebody_dim_is_dynamic(exported_model) -> None:
     at compile time) or silently truncates three-body terms (``T`` larger),
     producing wrong energies and forces.
 
+    This is the *second* of two defences, and it is normally unreachable:
+    while ``MATTERSIM_DYNAMIC_SHAPES`` declares this dim with the named
+    :data:`_THREEBODY_DIM`, ``torch.export`` itself raises
+    ``ConstraintViolationError`` first. It earns its keep if that spec is ever
+    weakened -- with ``Dim.AUTO`` (as originally shipped) export accepts the
+    specialization silently and this check is the only thing standing between
+    a frozen ``T`` and a corrupt artifact.
+
     Args:
         exported_model: The :class:`torch.export.ExportedProgram` to check.
 
@@ -439,6 +448,8 @@ def compile_m3gnet_aoti(
         example_inputs,
         dynamic_shapes=MATTERSIM_DYNAMIC_SHAPES,
     )
+    # Backstop: the named _THREEBODY_DIM above normally makes export itself
+    # raise on specialization, so this only fires if that spec is weakened.
     assert_threebody_dim_is_dynamic(exported_model)
 
     logger.info("AOTI compiling and packaging...")

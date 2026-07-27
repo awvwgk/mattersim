@@ -224,6 +224,11 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
         "final",
         "normalizer",
     }
+    targets.update(
+        name
+        for name, _module in cpu_potential.model.named_modules()
+        if name.startswith("graph_conv.0.")
+    )
 
     def flatten_tensors(value):
         if isinstance(value, torch.Tensor):

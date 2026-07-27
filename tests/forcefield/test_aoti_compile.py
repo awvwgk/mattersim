@@ -191,6 +191,8 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
     """Temporarily locate the first CPU/MPS model divergence."""
     import platform
 
+    from mattersim.forcefield.m3gnet.modules.message_passing import polynomial
+    from mattersim.forcefield.m3gnet.modules.scatter import scatter_sum
     from mattersim.forcefield.potential import Potential, batch_to_dict
 
     atoms = perturb(si_diamond, displacement=0.05)
@@ -251,6 +253,59 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
 
     cpu_energy, cpu_stages = run_and_capture(cpu_potential.model, inputs["cpu"])
     mps_energy, mps_stages = run_and_capture(mps_potential.model, inputs["mps"])
+
+    model = cpu_potential.model
+    input_dict = inputs["cpu"]
+    pos = input_dict["atom_pos"]
+    edge_index = input_dict["edge_index"].long()
+    three_body_indices = input_dict["three_body_indices"].long()
+    edge_batch = input_dict["batch"][edge_index[0]]
+    edge_vector = pos[edge_index[0]] - (
+        pos[edge_index[1]]
+        + torch.einsum(
+            "bi, bij->bj",
+            input_dict["pbc_offsets"].to(pos.dtype),
+            input_dict["cell"][edge_batch],
+        )
+    )
+    edge_length = torch.linalg.norm(edge_vector, dim=1)
+    vij = edge_vector[three_body_indices[:, 0]]
+    vik = edge_vector[three_body_indices[:, 1]]
+    rij = edge_length[three_body_indices[:, 0]]
+    rik = edge_length[three_body_indices[:, 1]]
+    cos_jik = torch.sum(vij * vik, dim=1) / (rij * rik)
+    cos_jik = torch.clamp(cos_jik, min=-1.0 + 1e-7, max=1.0 - 1e-7)
+    atom_attr = model.atom_embedding(
+        model.one_hot_atoms(input_dict["atom_attr"].squeeze(1).long())
+    )
+    three_basis = model.sbf(rik, torch.acos(cos_jik))
+    interaction = model.graph_conv[0].three_body
+    atom_mask = (
+        interaction.atom_mlp(atom_attr)[edge_index[0][three_body_indices[:, 1]]]
+        * polynomial(
+            edge_length[three_body_indices[:, 0]],
+            interaction.threebody_cutoff,
+        )
+        * polynomial(
+            edge_length[three_body_indices[:, 1]],
+            interaction.threebody_cutoff,
+        )
+    )
+    scatter_source = three_basis * atom_mask
+    scatter_index = three_body_indices[:, 0]
+    cpu_scatter = scatter_sum(
+        scatter_source,
+        scatter_index,
+        dim=0,
+        dim_size=edge_index.shape[1],
+    )
+    mps_scatter = scatter_sum(
+        scatter_source.to("mps"),
+        scatter_index.to("mps"),
+        dim=0,
+        dim_size=edge_index.shape[1],
+    ).cpu()
+
     stage_diffs = {
         name: float((cpu_stages[name] - mps_stages[name]).abs().max())
         for name in targets
@@ -260,6 +315,7 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
         "torch": torch.__version__,
         "cpu_energy": cpu_energy.tolist(),
         "mps_energy": mps_energy.tolist(),
+        "first_scatter_max_abs": float((cpu_scatter - mps_scatter).abs().max()),
         "stage_max_abs": stage_diffs,
     }
     pytest.fail(f"MPS stage diagnostic: {report}")

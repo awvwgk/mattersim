@@ -42,6 +42,7 @@ from ase.build import bulk
 from ase.units import GPa
 from torch.export.dynamic_shapes import Dim
 
+from mattersim.__version__ import __version__
 from mattersim.datasets.utils.build import build_dataloader
 from mattersim.forcefield.m3gnet.m3gnet import M3Gnet
 from mattersim.forcefield.potential import batch_to_dict
@@ -373,9 +374,10 @@ def _get_cache_path(
     """Deterministic cache path for a compiled model."""
     cache_dir = Path.home() / ".cache" / "mattersim" / "aoti"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Include torch version in hash so recompilation happens on upgrades
+    # Include the torch and mattersim versions in the hash so that upgrades
+    # (which may change the traced graph) never reuse a stale artifact.
     outputs_tag = settings.outputs_tag
-    key = f"{version}_{device}_{outputs_tag}_{torch.__version__}"
+    key = f"{version}_{device}_{outputs_tag}_{torch.__version__}_{__version__}"
     h = hashlib.md5(key.encode()).hexdigest()[:12]
     return str(cache_dir / f"mattersim_{version}_{device}_{outputs_tag}_{h}.pt2")
 

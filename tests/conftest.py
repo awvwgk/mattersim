@@ -102,3 +102,11 @@ def mattersim_potential_best_device():
     from mattersim.forcefield.potential import Potential
 
     return Potential.from_checkpoint(device=best_device(), load_training_state=False)
+
+
+@pytest.fixture(scope="module")
+def mattersim_potential_cpu():
+    """MatterSim 1M potential pinned to CPU (no training state)."""
+    from mattersim.forcefield.potential import Potential
+
+    return Potential.from_checkpoint(device="cpu", load_training_state=False)

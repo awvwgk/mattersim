@@ -30,6 +30,7 @@ Usage::
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from ase.build import bulk
 from ase.units import GPa
 from torch.export.dynamic_shapes import Dim
 
+from mattersim.__version__ import __version__
 from mattersim.datasets.utils.build import build_dataloader
 from mattersim.forcefield.m3gnet.m3gnet import M3Gnet
 from mattersim.forcefield.potential import batch_to_dict
@@ -49,6 +51,7 @@ from mattersim.forcefield.potential import batch_to_dict
 logger = logging.getLogger(__name__)
 
 _AOT_METADATA_KEY = "aot_inductor.metadata"
+_AOTI_CACHE_ABI = 2
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +87,7 @@ class AOTISettings:
                 "(stress computation needs position gradients)."
             )
         if not self.enabled and (
-            not self.include_forces
-            or not self.include_stresses
-            or self.force_recompile
+            not self.include_forces or not self.include_stresses or self.force_recompile
         ):
             raise ValueError(
                 "enabled=False disables AOTI entirely; other settings "
@@ -111,6 +112,9 @@ class AOTISettings:
 _BATCH_DIM = Dim("batch_size", min=1)
 _NODE_DIM = Dim("num_atoms", min=1)
 _EDGE_DIM = Dim("num_edges", min=1)
+# Named (rather than ``Dim.AUTO``) so that specializing the three-body count
+# raises during export instead of silently baking it into the artifact.
+_THREEBODY_DIM = Dim("num_triples", min=1)
 
 MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {0: _NODE_DIM, 1: Dim.STATIC},  # atom_pos [N, 3]
@@ -118,7 +122,7 @@ MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {0: _EDGE_DIM, 1: Dim.STATIC},  # pbc_offsets [E, 3]
     {0: _NODE_DIM, 1: Dim.STATIC},  # atom_attr [N, 1]
     {0: Dim.STATIC, 1: _EDGE_DIM},  # edge_index [2, E]
-    {0: Dim.AUTO, 1: Dim.STATIC},  # three_body_indices [T, 2]
+    {0: _THREEBODY_DIM, 1: Dim.STATIC},  # three_body_indices [T, 2]
     {0: _BATCH_DIM},  # num_three_body [B]
     {0: _BATCH_DIM},  # num_bonds [B]
     {0: _EDGE_DIM, 1: Dim.STATIC},  # num_triple_ij [E, 1]
@@ -192,16 +196,6 @@ class M3GNetForAOTI(nn.Module):
             )
             volume = torch.linalg.det(cell)
 
-        # Precompute derived fields for the model
-        cumsum = torch.cumsum(num_bonds, dim=0) - num_bonds
-        bond_index_bias = torch.repeat_interleave(
-            cumsum, num_three_body, dim=0
-        ).unsqueeze(-1)
-        index_map = torch.arange(edge_index.shape[1], device=num_triple_ij.device)
-        three_body_edge_map = torch.repeat_interleave(
-            index_map, num_triple_ij.view(-1)
-        )
-
         input_dict = {
             "atom_pos": atom_pos,
             "cell": cell,
@@ -215,8 +209,6 @@ class M3GNetForAOTI(nn.Module):
             "num_atoms": num_atoms,
             "num_graphs": num_graphs,
             "batch": batch,
-            "bond_index_bias": bond_index_bias,
-            "three_body_edge_map": three_body_edge_map,
         }
 
         energies = self.m3gnet.forward(input_dict)
@@ -249,12 +241,13 @@ class M3GNetForAOTI(nn.Module):
 # ---------------------------------------------------------------------------
 @contextlib.contextmanager
 def _fx_duck_shape(enabled: bool):
-    prev = torch.fx.experimental._config.use_duck_shape  # type: ignore[attr-defined]
-    torch.fx.experimental._config.use_duck_shape = enabled  # type: ignore[attr-defined]
+    config = torch.fx.experimental._config  # type: ignore[attr-defined]
+    prev = config.use_duck_shape
+    config.use_duck_shape = enabled
     try:
         yield
     finally:
-        torch.fx.experimental._config.use_duck_shape = prev  # type: ignore[attr-defined]
+        config.use_duck_shape = prev
 
 
 def _make_fx(model: nn.Module, inputs: tuple):
@@ -315,18 +308,35 @@ def _get_example_inputs(
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
+def _model_fingerprint(m3gnet: M3Gnet) -> str:
+    """Return a stable digest of the model configuration and state."""
+    digest = hashlib.sha256()
+    model_args = json.dumps(m3gnet.model_args, sort_keys=True)
+    digest.update(model_args.encode())
+    for name, tensor in sorted(m3gnet.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(str(tuple(value.shape)).encode())
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _get_cache_path(
     version: str,
     device: str,
     settings: AOTISettings,
+    model_fingerprint: str,
 ) -> str:
     """Deterministic cache path for a compiled model."""
     cache_dir = Path.home() / ".cache" / "mattersim" / "aoti"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Include torch version in hash so recompilation happens on upgrades
     outputs_tag = settings.outputs_tag
-    key = f"{version}_{device}_{outputs_tag}_{torch.__version__}"
-    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    key = (
+        f"{_AOTI_CACHE_ABI}_{version}_{device}_{outputs_tag}_"
+        f"{torch.__version__}_{__version__}_{model_fingerprint}"
+    )
+    h = hashlib.sha256(key.encode()).hexdigest()[:12]
     return str(cache_dir / f"mattersim_{version}_{device}_{outputs_tag}_{h}.pt2")
 
 
@@ -350,7 +360,12 @@ def compile_m3gnet_aoti(
     Returns:
         Path to the compiled .pt2 package.
     """
-    cache_path = _get_cache_path(version, device, settings=settings)
+    cache_path = _get_cache_path(
+        version,
+        device,
+        settings=settings,
+        model_fingerprint=_model_fingerprint(m3gnet),
+    )
     if os.path.exists(cache_path) and not settings.force_recompile:
         logger.info(f"AOTI compiled model found in cache: {cache_path}")
         return cache_path
@@ -368,9 +383,7 @@ def compile_m3gnet_aoti(
     wrapper.eval()
     wrapper.to(device)
 
-    example_inputs = _get_example_inputs(
-        cutoff, threebody_cutoff, torch.device(device)
-    )
+    example_inputs = _get_example_inputs(cutoff, threebody_cutoff, torch.device(device))
 
     # Validate eager model first
     logger.info("Validating eager model outputs...")
@@ -489,8 +502,7 @@ class AOTIModelWrapper(nn.Module):
     def enable_gradient_checkpointing(self, enable: bool = True) -> None:
         if enable:
             logger.warning(
-                "Gradient checkpointing is not supported for "
-                "AOTI-compiled models."
+                "Gradient checkpointing is not supported for " "AOTI-compiled models."
             )
 
 

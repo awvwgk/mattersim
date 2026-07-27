@@ -25,7 +25,8 @@ jobs:
         os: [ubuntu-latest]
         python-version: ['3.12', '3.13']
         include:
-          - os: macos-latest
+          # macOS 26 produces incorrect MPS linear results with PyTorch 2.13.
+          - os: macos-15
             python-version: '3.12'
 
     steps:

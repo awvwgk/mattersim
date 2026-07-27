@@ -186,6 +186,59 @@ def test_model_fingerprint_tracks_weights_and_config(mattersim_potential_cpu):
         model.model_args["cutoff"] = original_cutoff
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_mps_eager_script_diagnostics(si_diamond, perturb):
+    """Temporarily report the first MPS divergence for CI investigation."""
+    import platform
+
+    from mattersim.forcefield import MatterSimCalculator
+    from mattersim.forcefield.m3gnet.modules import angle_encoding
+
+    def output_and_gradient(function, value):
+        value = value.clone().requires_grad_(True)
+        output = function(3, value)
+        gradient = torch.autograd.grad(output.sum(), value)[0]
+        return output, gradient
+
+    x = torch.linspace(-1.0, 1.0, 257, device="mps")
+    eager_output, eager_gradient = output_and_gradient(
+        angle_encoding._spherical_harmonics, x
+    )
+    scripted_output, scripted_gradient = output_and_gradient(
+        angle_encoding._scripted_spherical_harmonics, x
+    )
+
+    layer = angle_encoding.SphericalBasisLayer(max_n=4, max_l=4, cutoff=5.0).to("mps")
+    r = torch.linspace(0.5, 4.5, 257, device="mps")
+    theta = torch.linspace(0.0, np.pi, 257, device="mps")
+    scripted_function = angle_encoding._scripted_spherical_harmonics
+    angle_encoding._scripted_spherical_harmonics = angle_encoding._spherical_harmonics
+    try:
+        eager_layer_output = layer(r, theta)
+    finally:
+        angle_encoding._scripted_spherical_harmonics = scripted_function
+    scripted_layer_output = layer(r, theta)
+
+    atoms = perturb(si_diamond, displacement=0.05)
+    atoms.calc = MatterSimCalculator(device="mps")
+    report = {
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "helper_output_max_abs": (eager_output - scripted_output).abs().max().item(),
+        "helper_gradient_max_abs": (eager_gradient - scripted_gradient)
+        .abs()
+        .max()
+        .item(),
+        "layer_output_max_abs": (eager_layer_output - scripted_layer_output)
+        .abs()
+        .max()
+        .item(),
+        "initial_energy_per_atom": atoms.get_potential_energy() / len(atoms),
+        "initial_force_max": np.linalg.norm(atoms.get_forces(), axis=1).max(),
+    }
+    pytest.fail(f"MPS diagnostic: {report}")
+
+
 @requires_gpu
 class TestAOTIMatchesEager:
     """AOTI-vs-eager numeric parity across three-body counts.

@@ -147,15 +147,19 @@ class TestSphericalHarmonicsScripting:
         for lmax in range(4):
             assert torch.equal(_spherical_harmonics(lmax, x), scripted(lmax, x))
 
-    def test_enclosing_layer_is_still_scriptable(self):
+    def test_enclosing_layer_is_still_scriptable(self, available_device):
         from mattersim.forcefield.m3gnet.modules.angle_encoding import (
             SphericalBasisLayer,
         )
 
-        layer = SphericalBasisLayer(max_n=4, max_l=4, cutoff=5.0).eval()
+        layer = (
+            SphericalBasisLayer(max_n=4, max_l=4, cutoff=5.0)
+            .eval()
+            .to(available_device)
+        )
         scripted = torch.jit.script(layer)
-        r = torch.linspace(0.5, 4.5, 64)
-        theta = torch.linspace(0.0, np.pi, 64)
+        r = torch.linspace(0.5, 4.5, 64, device=available_device)
+        theta = torch.linspace(0.0, np.pi, 64, device=available_device)
         assert torch.equal(layer(r, theta), scripted(r, theta))
 
 

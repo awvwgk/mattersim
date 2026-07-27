@@ -11,14 +11,6 @@ import torch
 import torch.nn as nn
 
 
-# NOTE: deliberately *not* decorated with ``@torch.jit.script``.
-# The TorchScript interpreter emits ``aten::size`` on its inputs, which under
-# symbolic tracing (``make_fx``/``torch.export``) calls ``int()`` on the
-# SymInt and thereby pins the three-body count ``T`` to the compile-time
-# example value. That silently bakes a constant ``T`` into the AOTI artifact
-# and corrupts energies/forces at runtime (see ``forcefield/aoti_compile.py``).
-# ``torch.jit.script`` on an enclosing module still compiles this function
-# recursively, so TorchScript support is unaffected.
 def _spherical_harmonics(lmax: int, x: torch.Tensor) -> torch.Tensor:
     sh_0_0 = torch.ones_like(x) * 0.5 * math.sqrt(1.0 / math.pi)
     if lmax == 0:
@@ -42,6 +34,9 @@ def _spherical_harmonics(lmax: int, x: torch.Tensor) -> torch.Tensor:
         return torch.stack([sh_0_0, sh_1_1, sh_2_2, sh_3_3], dim=-1)
 
     raise ValueError("lmax must be less than 8")
+
+
+_scripted_spherical_harmonics = torch.jit.script(_spherical_harmonics)
 
 
 class SphericalBasisLayer(nn.Module):
@@ -249,7 +244,10 @@ class SphericalBasisLayer(nn.Module):
         rbfs = torch.stack(rbfs, dim=-1)
         rbfs = rbfs * self.factor
 
-        cbfs = _spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
+        if theta_val.device.type == "mps":
+            cbfs = _scripted_spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
+        else:
+            cbfs = _spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
         cbfs = cbfs.repeat_interleave(self.max_n, dim=1)
 
         return rbfs * cbfs

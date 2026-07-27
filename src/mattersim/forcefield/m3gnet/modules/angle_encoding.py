@@ -36,9 +36,6 @@ def _spherical_harmonics(lmax: int, x: torch.Tensor) -> torch.Tensor:
     raise ValueError("lmax must be less than 8")
 
 
-_scripted_spherical_harmonics = torch.jit.script(_spherical_harmonics)
-
-
 class SphericalBasisLayer(nn.Module):
     def __init__(self, max_n, max_l, cutoff):
         super(SphericalBasisLayer, self).__init__()
@@ -244,10 +241,7 @@ class SphericalBasisLayer(nn.Module):
         rbfs = torch.stack(rbfs, dim=-1)
         rbfs = rbfs * self.factor
 
-        if theta_val.device.type == "mps":
-            cbfs = _scripted_spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
-        else:
-            cbfs = _spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
+        cbfs = _spherical_harmonics(self.max_l - 1, torch.cos(theta_val))
         cbfs = cbfs.repeat_interleave(self.max_n, dim=1)
 
         return rbfs * cbfs

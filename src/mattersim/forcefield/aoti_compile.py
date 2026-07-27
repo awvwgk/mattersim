@@ -199,16 +199,6 @@ class M3GNetForAOTI(nn.Module):
             )
             volume = torch.linalg.det(cell)
 
-        # Precompute derived fields for the model
-        cumsum = torch.cumsum(num_bonds, dim=0) - num_bonds
-        bond_index_bias = torch.repeat_interleave(
-            cumsum, num_three_body, dim=0
-        ).unsqueeze(-1)
-        index_map = torch.arange(edge_index.shape[1], device=num_triple_ij.device)
-        three_body_edge_map = torch.repeat_interleave(
-            index_map, num_triple_ij.view(-1)
-        )
-
         input_dict = {
             "atom_pos": atom_pos,
             "cell": cell,
@@ -222,8 +212,6 @@ class M3GNetForAOTI(nn.Module):
             "num_atoms": num_atoms,
             "num_graphs": num_graphs,
             "batch": batch,
-            "bond_index_bias": bond_index_bias,
-            "three_body_edge_map": three_body_edge_map,
         }
 
         energies = self.m3gnet.forward(input_dict)

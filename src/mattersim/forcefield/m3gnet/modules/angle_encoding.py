@@ -11,6 +11,14 @@ import torch
 import torch.nn as nn
 
 
+# NOTE: deliberately *not* decorated with ``@torch.jit.script``.
+# The TorchScript interpreter emits ``aten::size`` on its inputs, which under
+# symbolic tracing (``make_fx``/``torch.export``) calls ``int()`` on the
+# SymInt and thereby pins the three-body count ``T`` to the compile-time
+# example value. That silently bakes a constant ``T`` into the AOTI artifact
+# and corrupts energies/forces at runtime (see ``forcefield/aoti_compile.py``).
+# ``torch.jit.script`` on an enclosing module still compiles this function
+# recursively, so TorchScript support is unaffected.
 def _spherical_harmonics(lmax: int, x: torch.Tensor) -> torch.Tensor:
     sh_0_0 = torch.ones_like(x) * 0.5 * math.sqrt(1.0 / math.pi)
     if lmax == 0:

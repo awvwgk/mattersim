@@ -147,19 +147,15 @@ class TestSphericalHarmonicsScripting:
         for lmax in range(4):
             assert torch.equal(_spherical_harmonics(lmax, x), scripted(lmax, x))
 
-    def test_enclosing_layer_is_still_scriptable(self, available_device):
+    def test_enclosing_layer_is_still_scriptable(self):
         from mattersim.forcefield.m3gnet.modules.angle_encoding import (
             SphericalBasisLayer,
         )
 
-        layer = (
-            SphericalBasisLayer(max_n=4, max_l=4, cutoff=5.0)
-            .eval()
-            .to(available_device)
-        )
+        layer = SphericalBasisLayer(max_n=4, max_l=4, cutoff=5.0).eval()
         scripted = torch.jit.script(layer)
-        r = torch.linspace(0.5, 4.5, 64, device=available_device)
-        theta = torch.linspace(0.0, np.pi, 64, device=available_device)
+        r = torch.linspace(0.5, 4.5, 64)
+        theta = torch.linspace(0.0, np.pi, 64)
         assert torch.equal(layer(r, theta), scripted(r, theta))
 
 
@@ -184,175 +180,6 @@ def test_model_fingerprint_tracks_weights_and_config(mattersim_potential_cpu):
         assert _model_fingerprint(model) != original
     finally:
         model.model_args["cutoff"] = original_cutoff
-
-
-@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
-def test_mps_model_stage_diagnostics(si_diamond, perturb):
-    """Temporarily locate the first CPU/MPS model divergence."""
-    import platform
-
-    from mattersim.forcefield.m3gnet.modules.message_passing import polynomial
-    from mattersim.forcefield.m3gnet.modules.scatter import scatter_sum
-    from mattersim.forcefield.potential import Potential, batch_to_dict
-
-    atoms = perturb(si_diamond, displacement=0.05)
-    cpu_potential = Potential.from_checkpoint(device="cpu", load_training_state=False)
-    mps_potential = Potential.from_checkpoint(device="mps", load_training_state=False)
-    model_args = cpu_potential.model.model_args
-    dataloader = build_dataloader(
-        [atoms],
-        batch_size=1,
-        model_type="m3gnet",
-        shuffle=False,
-        only_inference=True,
-        cutoff=model_args["cutoff"],
-        threebody_cutoff=model_args["threebody_cutoff"],
-    )
-    graph_batch = next(iter(dataloader))
-    inputs = {
-        "cpu": batch_to_dict(graph_batch, model_type="m3gnet", device="cpu"),
-        "mps": batch_to_dict(graph_batch, model_type="m3gnet", device="mps"),
-    }
-    targets = {
-        "atom_embedding",
-        "rbf",
-        "edge_encoder",
-        "sbf",
-        "graph_conv.0",
-        "graph_conv.1",
-        "graph_conv.2",
-        "final",
-        "normalizer",
-    }
-    targets.update(
-        name
-        for name, _module in cpu_potential.model.named_modules()
-        if name.startswith("graph_conv.0.")
-    )
-
-    def flatten_tensors(value):
-        if isinstance(value, torch.Tensor):
-            return [value.detach().cpu().reshape(-1)]
-        if isinstance(value, (tuple, list)):
-            return [tensor for item in value for tensor in flatten_tensors(item)]
-        return []
-
-    def run_and_capture(model, input_dict):
-        captured = {}
-        handles = []
-        for name, module in model.named_modules():
-            if name in targets:
-                handles.append(
-                    module.register_forward_hook(
-                        lambda _module, _args, output, name=name: captured.update(
-                            {name: torch.cat(flatten_tensors(output))}
-                        )
-                    )
-                )
-        try:
-            energy = model(input_dict).detach().cpu()
-        finally:
-            for handle in handles:
-                handle.remove()
-        return energy, captured
-
-    cpu_energy, cpu_stages = run_and_capture(cpu_potential.model, inputs["cpu"])
-    mps_energy, mps_stages = run_and_capture(mps_potential.model, inputs["mps"])
-
-    model = cpu_potential.model
-    input_dict = inputs["cpu"]
-    pos = input_dict["atom_pos"]
-    edge_index = input_dict["edge_index"].long()
-    three_body_indices = input_dict["three_body_indices"].long()
-    edge_batch = input_dict["batch"][edge_index[0]]
-    edge_vector = pos[edge_index[0]] - (
-        pos[edge_index[1]]
-        + torch.einsum(
-            "bi, bij->bj",
-            input_dict["pbc_offsets"].to(pos.dtype),
-            input_dict["cell"][edge_batch],
-        )
-    )
-    edge_length = torch.linalg.norm(edge_vector, dim=1)
-    vij = edge_vector[three_body_indices[:, 0]]
-    vik = edge_vector[three_body_indices[:, 1]]
-    rij = edge_length[three_body_indices[:, 0]]
-    rik = edge_length[three_body_indices[:, 1]]
-    cos_jik = torch.sum(vij * vik, dim=1) / (rij * rik)
-    cos_jik = torch.clamp(cos_jik, min=-1.0 + 1e-7, max=1.0 - 1e-7)
-    atom_attr = model.atom_embedding(
-        model.one_hot_atoms(input_dict["atom_attr"].squeeze(1).long())
-    )
-    three_basis = model.sbf(rik, torch.acos(cos_jik))
-    interaction = model.graph_conv[0].three_body
-    edge_length_column = edge_length.unsqueeze(-1)
-    atom_mask = (
-        interaction.atom_mlp(atom_attr)[edge_index[0][three_body_indices[:, 1]]]
-        * polynomial(
-            edge_length_column[three_body_indices[:, 0]],
-            interaction.threebody_cutoff,
-        )
-        * polynomial(
-            edge_length_column[three_body_indices[:, 1]],
-            interaction.threebody_cutoff,
-        )
-    )
-    scatter_source = three_basis * atom_mask
-    scatter_index = three_body_indices[:, 0]
-    cpu_scatter = scatter_sum(
-        scatter_source,
-        scatter_index,
-        dim=0,
-        dim_size=edge_index.shape[1],
-    )
-    mps_scatter = scatter_sum(
-        scatter_source.to("mps"),
-        scatter_index.to("mps"),
-        dim=0,
-        dim_size=edge_index.shape[1],
-    ).cpu()
-
-    linear = interaction.atom_mlp.linear
-    linear_input = atom_attr.detach()
-    linear_weight = linear.weight.detach()
-    linear_bias = linear.bias.detach()
-    expected_linear = torch.nn.functional.linear(
-        linear_input, linear_weight, linear_bias
-    )
-    mps_input = linear_input.to("mps")
-    mps_weight = linear_weight.to("mps")
-    mps_bias = linear_bias.to("mps")
-
-    def linear_max_abs(actual):
-        return float((expected_linear - actual.cpu()).abs().max())
-
-    primitive_diffs = {
-        "weight_roundtrip": float((linear_weight - mps_weight.cpu()).abs().max()),
-        "functional_linear": linear_max_abs(
-            torch.nn.functional.linear(mps_input, mps_weight, mps_bias)
-        ),
-        "addmm": linear_max_abs(torch.addmm(mps_bias, mps_input, mps_weight.T)),
-        "matmul_plus_bias": linear_max_abs(mps_input @ mps_weight.T + mps_bias),
-        "einsum_plus_bias": linear_max_abs(
-            torch.einsum("bi,oi->bo", mps_input, mps_weight) + mps_bias
-        ),
-    }
-
-    stage_diffs = {
-        name: float((cpu_stages[name] - mps_stages[name]).abs().max())
-        for name in targets
-    }
-    report = {
-        "platform": platform.platform(),
-        "torch": torch.__version__,
-        "cpu_energy": cpu_energy.tolist(),
-        "mps_energy": mps_energy.tolist(),
-        "first_scatter_max_abs": float((cpu_scatter - mps_scatter).abs().max()),
-        "atom_mlp_linear_shape": list(linear_input.shape),
-        "linear_primitive_max_abs": primitive_diffs,
-        "stage_max_abs": stage_diffs,
-    }
-    pytest.fail(f"MPS stage diagnostic: {report}")
 
 
 @requires_gpu

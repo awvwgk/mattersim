@@ -312,6 +312,32 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
         dim_size=edge_index.shape[1],
     ).cpu()
 
+    linear = interaction.atom_mlp.linear
+    linear_input = atom_attr.detach()
+    linear_weight = linear.weight.detach()
+    linear_bias = linear.bias.detach()
+    expected_linear = torch.nn.functional.linear(
+        linear_input, linear_weight, linear_bias
+    )
+    mps_input = linear_input.to("mps")
+    mps_weight = linear_weight.to("mps")
+    mps_bias = linear_bias.to("mps")
+
+    def linear_max_abs(actual):
+        return float((expected_linear - actual.cpu()).abs().max())
+
+    primitive_diffs = {
+        "weight_roundtrip": float((linear_weight - mps_weight.cpu()).abs().max()),
+        "functional_linear": linear_max_abs(
+            torch.nn.functional.linear(mps_input, mps_weight, mps_bias)
+        ),
+        "addmm": linear_max_abs(torch.addmm(mps_bias, mps_input, mps_weight.T)),
+        "matmul_plus_bias": linear_max_abs(mps_input @ mps_weight.T + mps_bias),
+        "einsum_plus_bias": linear_max_abs(
+            torch.einsum("bi,oi->bo", mps_input, mps_weight) + mps_bias
+        ),
+    }
+
     stage_diffs = {
         name: float((cpu_stages[name] - mps_stages[name]).abs().max())
         for name in targets
@@ -322,6 +348,8 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
         "cpu_energy": cpu_energy.tolist(),
         "mps_energy": mps_energy.tolist(),
         "first_scatter_max_abs": float((cpu_scatter - mps_scatter).abs().max()),
+        "atom_mlp_linear_shape": list(linear_input.shape),
+        "linear_primitive_max_abs": primitive_diffs,
         "stage_max_abs": stage_diffs,
     }
     pytest.fail(f"MPS stage diagnostic: {report}")

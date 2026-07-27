@@ -111,6 +111,10 @@ class AOTISettings:
 _BATCH_DIM = Dim("batch_size", min=1)
 _NODE_DIM = Dim("num_atoms", min=1)
 _EDGE_DIM = Dim("num_edges", min=1)
+# Named (rather than ``Dim.AUTO``) on purpose: ``Dim.AUTO`` silently accepts a
+# specialization guard, so an op that materializes the three-body count would
+# bake the compile-time value into the artifact instead of failing the export.
+_THREEBODY_DIM = Dim("num_triples", min=1)
 
 MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {0: _NODE_DIM, 1: Dim.STATIC},  # atom_pos [N, 3]
@@ -118,7 +122,7 @@ MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {0: _EDGE_DIM, 1: Dim.STATIC},  # pbc_offsets [E, 3]
     {0: _NODE_DIM, 1: Dim.STATIC},  # atom_attr [N, 1]
     {0: Dim.STATIC, 1: _EDGE_DIM},  # edge_index [2, E]
-    {0: Dim.AUTO, 1: Dim.STATIC},  # three_body_indices [T, 2]
+    {0: _THREEBODY_DIM, 1: Dim.STATIC},  # three_body_indices [T, 2]
     {0: _BATCH_DIM},  # num_three_body [B]
     {0: _BATCH_DIM},  # num_bonds [B]
     {0: _EDGE_DIM, 1: Dim.STATIC},  # num_triple_ij [E, 1]
@@ -126,6 +130,9 @@ MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {},  # num_graphs (scalar)
     {0: _NODE_DIM},  # batch [N]
 )
+
+# Position of ``three_body_indices`` in ``M3GNetForAOTI.forward``'s signature.
+_THREEBODY_INPUT_INDEX = 5
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +276,61 @@ def _make_fx(model: nn.Module, inputs: tuple):
         )(*[i.clone() for i in inputs])
 
 
+def is_dynamic_dim(dim) -> bool:
+    """Whether a tensor dimension is genuinely dynamic.
+
+    A specialized dimension is not necessarily a plain ``int``: a guard such
+    as ``Eq(s52, 3840)`` leaves a ``torch.SymInt`` in place whose expression
+    has been refined to the sympy constant ``3840``. Such a dim prints as
+    ``3840`` and is still a ``SymInt``, so an ``isinstance(dim, int)`` test
+    would wrongly report it as dynamic. Check for free symbols instead.
+    """
+    if isinstance(dim, int):
+        return False
+    expr = getattr(getattr(dim, "node", None), "expr", None)
+    return bool(getattr(expr, "free_symbols", set()))
+
+
+def assert_threebody_dim_is_dynamic(exported_model) -> None:
+    """Fail loudly if the three-body dimension was specialized during export.
+
+    ``three_body_indices`` has shape ``[T, 2]`` where ``T`` is the number of
+    angle terms; it changes with the topology on every MD step. If any traced
+    op materializes ``T`` as a Python ``int`` (e.g. via ``aten.size.default``,
+    which ``guard_int``s the SymInt), the compile-time value is baked into the
+    artifact. At runtime that either indexes out of bounds (``T`` smaller than
+    at compile time) or silently truncates three-body terms (``T`` larger),
+    producing wrong energies and forces.
+
+    Args:
+        exported_model: The :class:`torch.export.ExportedProgram` to check.
+
+    Raises:
+        RuntimeError: If the ``three_body_indices`` leading dimension carries
+            no free symbols, i.e. it was pinned to a constant.
+    """
+    user_inputs = list(exported_model.graph_signature.user_inputs)
+    target = user_inputs[_THREEBODY_INPUT_INDEX]
+    node = next(
+        n
+        for n in exported_model.graph.nodes
+        if n.op == "placeholder" and n.name == target
+    )
+    dim0 = node.meta["val"].shape[0]
+    if not is_dynamic_dim(dim0):
+        raise RuntimeError(
+            "AOTI export specialized the three-body dimension of "
+            f"'three_body_indices' to the constant {dim0}. The compiled "
+            "artifact would be valid only for structures with exactly that "
+            "many angle terms and would silently return wrong energies and "
+            "forces otherwise. Some op in the model materializes the size of "
+            "a three-body-dimensioned tensor as a Python int; re-run the "
+            "export with TORCH_LOGS='+dynamic' and "
+            f"TORCHDYNAMO_EXTENDED_DEBUG_GUARD_ADDED='Eq(s?, {dim0})' to "
+            "locate it."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Example input generation
 # ---------------------------------------------------------------------------
@@ -387,6 +449,7 @@ def compile_m3gnet_aoti(
         example_inputs,
         dynamic_shapes=MATTERSIM_DYNAMIC_SHAPES,
     )
+    assert_threebody_dim_is_dynamic(exported_model)
 
     logger.info("AOTI compiling and packaging...")
     torch._inductor.aoti_compile_and_package(

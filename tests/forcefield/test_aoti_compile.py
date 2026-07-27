@@ -14,14 +14,12 @@ import torch
 
 from mattersim.datasets.utils.build import build_dataloader
 from mattersim.forcefield.aoti_compile import (
-    _THREEBODY_INPUT_INDEX,
     MATTERSIM_DYNAMIC_SHAPES,
     AOTISettings,
     M3GNetForAOTI,
     _get_example_inputs,
     _make_fx,
-    assert_threebody_dim_is_dynamic,
-    is_dynamic_dim,
+    _model_fingerprint,
 )
 
 requires_gpu = pytest.mark.skipif(
@@ -31,6 +29,7 @@ requires_gpu = pytest.mark.skipif(
 # Number of three-body terms in the compile-time example
 # (``_get_example_inputs``: two 8-atom Si-diamond-cubic cells).
 EXAMPLE_NUM_TRIPLES = 3840
+THREEBODY_INPUT_INDEX = 5
 
 
 def _export(potential, device: str):
@@ -46,27 +45,10 @@ def _export(potential, device: str):
         m3gnet.model_args["threebody_cutoff"],
         torch.device(device),
     )
-    assert example_inputs[_THREEBODY_INPUT_INDEX].shape[0] == EXAMPLE_NUM_TRIPLES
+    assert example_inputs[THREEBODY_INPUT_INDEX].shape[0] == EXAMPLE_NUM_TRIPLES
     fx_model = _make_fx(wrapper, example_inputs)
     return torch.export.export(
         fx_model, example_inputs, dynamic_shapes=MATTERSIM_DYNAMIC_SHAPES
-    )
-
-
-class _FakeShape:
-    """Minimal stand-in for a tensor whose ``.shape`` we control in tests."""
-
-    def __init__(self, shape):
-        self.shape = shape
-
-
-def _threebody_placeholder(exported_model):
-    """The ``three_body_indices`` placeholder node of an exported program."""
-    target = exported_model.graph_signature.user_inputs[_THREEBODY_INPUT_INDEX]
-    return next(
-        n
-        for n in exported_model.graph.nodes
-        if n.op == "placeholder" and n.name == target
     )
 
 
@@ -81,6 +63,17 @@ def _placeholder_shapes(exported_model):
         name: tuple(by_name[name].meta["val"].shape)
         for name in exported_model.graph_signature.user_inputs
     }
+
+
+def _is_dynamic_dim(dim) -> bool:
+    """Whether a tensor dimension has at least one free symbol."""
+    expr = getattr(getattr(dim, "node", None), "expr", None)
+    return bool(getattr(expr, "free_symbols", set()))
+
+
+@pytest.fixture(scope="module")
+def exported_model_cpu(mattersim_potential_cpu):
+    return _export(mattersim_potential_cpu, "cpu")
 
 
 @pytest.fixture(scope="module")
@@ -102,79 +95,37 @@ def mattersim_potential_aoti():
 class TestExportKeepsShapesDynamic:
     """Export-level tests: fast, no full AOTI compile, CPU is enough."""
 
-    def test_threebody_dim_stays_symbolic(self, mattersim_potential_cpu):
+    def test_threebody_dim_stays_symbolic(self, exported_model_cpu):
         """The three-body dimension must not be specialized to a constant.
 
         This is the direct regression for the root cause: a specialized ``T``
         makes the compiled artifact valid only for structures with exactly
         that many angle terms.
         """
-        exported_model = _export(mattersim_potential_cpu, "cpu")
-        shapes = _placeholder_shapes(exported_model)
+        shapes = _placeholder_shapes(exported_model_cpu)
         three_body = shapes[
-            exported_model.graph_signature.user_inputs[_THREEBODY_INPUT_INDEX]
+            exported_model_cpu.graph_signature.user_inputs[THREEBODY_INPUT_INDEX]
         ]
 
-        assert is_dynamic_dim(three_body[0]), (
-            f"three_body_indices dim 0 was specialized to {three_body[0]}; "
+        assert _is_dynamic_dim(three_body[0]), (
+            f"three_body_indices dim 0 was specialized to {three_body[0]}. "
             "the AOTI artifact would be wrong for any other three-body count"
         )
         # dim 1 is the (i, k) edge pair and is genuinely static
         assert three_body[1] == 2
 
-    def test_all_variable_dims_stay_symbolic(self, mattersim_potential_cpu):
+    def test_all_variable_dims_stay_symbolic(self, exported_model_cpu):
         """Atom, edge, batch and three-body counts must all remain dynamic."""
-        exported_model = _export(mattersim_potential_cpu, "cpu")
-        shapes = _placeholder_shapes(exported_model)
+        shapes = _placeholder_shapes(exported_model_cpu)
 
         specialized = {
             name: shape
             for name, shape in shapes.items()
             # every user input has at least one variable-length dim except the
             # scalar ``num_graphs``
-            if shape and not any(is_dynamic_dim(s) for s in shape)
+            if shape and not any(_is_dynamic_dim(s) for s in shape)
         }
         assert not specialized, f"unexpectedly specialized inputs: {specialized}"
-
-    def test_assert_threebody_dim_is_dynamic_passes(self, mattersim_potential_cpu):
-        """The compile-time tripwire accepts a correctly exported model."""
-        assert_threebody_dim_is_dynamic(_export(mattersim_potential_cpu, "cpu"))
-
-    def test_assert_threebody_dim_is_dynamic_raises_on_int(
-        self, mattersim_potential_cpu
-    ):
-        """The tripwire rejects a three-body dim that is a plain ``int``."""
-        exported_model = _export(mattersim_potential_cpu, "cpu")
-        node = _threebody_placeholder(exported_model)
-        node.meta["val"] = torch.empty(
-            EXAMPLE_NUM_TRIPLES, 2, dtype=torch.long, device="meta"
-        )
-
-        with pytest.raises(RuntimeError, match="specialized the three-body"):
-            assert_threebody_dim_is_dynamic(exported_model)
-
-    def test_assert_threebody_dim_is_dynamic_raises_on_constant_symint(
-        self, mattersim_potential_cpu
-    ):
-        """The tripwire rejects a ``SymInt`` refined to a constant.
-
-        This is what a real specialization looks like: the guard
-        ``Eq(s52, 3840)`` leaves a ``SymInt`` in place whose sympy expression
-        is the constant ``3840``, so it is *not* a plain ``int``. An
-        ``isinstance(dim, int)`` check would let it through.
-        """
-        exported_model = _export(mattersim_potential_cpu, "cpu")
-        node = _threebody_placeholder(exported_model)
-        symbolic_dim = node.meta["val"].shape[0]
-        # cancels the symbol, leaving sympy Integer(EXAMPLE_NUM_TRIPLES)
-        constant_dim = symbolic_dim * 0 + EXAMPLE_NUM_TRIPLES
-
-        assert not isinstance(constant_dim, int), "expected a SymInt, not an int"
-        assert not is_dynamic_dim(constant_dim)
-
-        node.meta["val"] = _FakeShape((constant_dim, 2))
-        with pytest.raises(RuntimeError, match="specialized the three-body"):
-            assert_threebody_dim_is_dynamic(exported_model)
 
 
 class TestSphericalHarmonicsScripting:
@@ -206,6 +157,29 @@ class TestSphericalHarmonicsScripting:
         r = torch.linspace(0.5, 4.5, 64)
         theta = torch.linspace(0.0, np.pi, 64)
         assert torch.equal(layer(r, theta), scripted(r, theta))
+
+
+def test_model_fingerprint_tracks_weights_and_config(mattersim_potential_cpu):
+    """Cached artifacts must identify both model weights and configuration."""
+    model = mattersim_potential_cpu.model
+    original = _model_fingerprint(model)
+    parameter = next(model.parameters())
+    original_value = parameter.view(-1)[0].clone()
+    with torch.no_grad():
+        parameter.view(-1)[0].add_(1)
+    try:
+        assert _model_fingerprint(model) != original
+    finally:
+        with torch.no_grad():
+            parameter.view(-1)[0].copy_(original_value)
+
+    assert _model_fingerprint(model) == original
+    original_cutoff = model.model_args["cutoff"]
+    model.model_args["cutoff"] = original_cutoff + 1
+    try:
+        assert _model_fingerprint(model) != original
+    finally:
+        model.model_args["cutoff"] = original_cutoff
 
 
 @requires_gpu

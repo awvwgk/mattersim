@@ -30,6 +30,7 @@ Usage::
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from mattersim.forcefield.potential import batch_to_dict
 logger = logging.getLogger(__name__)
 
 _AOT_METADATA_KEY = "aot_inductor.metadata"
+_AOTI_CACHE_ABI = 2
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +87,7 @@ class AOTISettings:
                 "(stress computation needs position gradients)."
             )
         if not self.enabled and (
-            not self.include_forces
-            or not self.include_stresses
-            or self.force_recompile
+            not self.include_forces or not self.include_stresses or self.force_recompile
         ):
             raise ValueError(
                 "enabled=False disables AOTI entirely; other settings "
@@ -112,10 +112,8 @@ class AOTISettings:
 _BATCH_DIM = Dim("batch_size", min=1)
 _NODE_DIM = Dim("num_atoms", min=1)
 _EDGE_DIM = Dim("num_edges", min=1)
-# Named (rather than ``Dim.AUTO``) on purpose: ``Dim.AUTO`` silently accepts a
-# specialization guard, so an op that materializes the three-body count would
-# bake the compile-time value into the artifact instead of failing the export.
-# Paired with assert_threebody_dim_is_dynamic(), which backstops this spec.
+# Named (rather than ``Dim.AUTO``) so that specializing the three-body count
+# raises during export instead of silently baking it into the artifact.
 _THREEBODY_DIM = Dim("num_triples", min=1)
 
 MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
@@ -132,9 +130,6 @@ MATTERSIM_DYNAMIC_SHAPES: tuple[dict[int, Dim], ...] = (
     {},  # num_graphs (scalar)
     {0: _NODE_DIM},  # batch [N]
 )
-
-# Position of ``three_body_indices`` in ``M3GNetForAOTI.forward``'s signature.
-_THREEBODY_INPUT_INDEX = 5
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +241,13 @@ class M3GNetForAOTI(nn.Module):
 # ---------------------------------------------------------------------------
 @contextlib.contextmanager
 def _fx_duck_shape(enabled: bool):
-    prev = torch.fx.experimental._config.use_duck_shape  # type: ignore[attr-defined]
-    torch.fx.experimental._config.use_duck_shape = enabled  # type: ignore[attr-defined]
+    config = torch.fx.experimental._config  # type: ignore[attr-defined]
+    prev = config.use_duck_shape
+    config.use_duck_shape = enabled
     try:
         yield
     finally:
-        torch.fx.experimental._config.use_duck_shape = prev  # type: ignore[attr-defined]
+        config.use_duck_shape = prev
 
 
 def _make_fx(model: nn.Module, inputs: tuple):
@@ -264,69 +260,6 @@ def _make_fx(model: nn.Module, inputs: tuple):
             _allow_non_fake_inputs=True,
             _error_on_data_dependent_ops=True,
         )(*[i.clone() for i in inputs])
-
-
-def is_dynamic_dim(dim) -> bool:
-    """Whether a tensor dimension is genuinely dynamic.
-
-    A specialized dimension is not necessarily a plain ``int``: a guard such
-    as ``Eq(s52, 3840)`` leaves a ``torch.SymInt`` in place whose expression
-    has been refined to the sympy constant ``3840``. Such a dim prints as
-    ``3840`` and is still a ``SymInt``, so an ``isinstance(dim, int)`` test
-    would wrongly report it as dynamic. Check for free symbols instead.
-    """
-    if isinstance(dim, int):
-        return False
-    expr = getattr(getattr(dim, "node", None), "expr", None)
-    return bool(getattr(expr, "free_symbols", set()))
-
-
-def assert_threebody_dim_is_dynamic(exported_model) -> None:
-    """Fail loudly if the three-body dimension was specialized during export.
-
-    ``three_body_indices`` has shape ``[T, 2]`` where ``T`` is the number of
-    angle terms; it changes with the topology on every MD step. If any traced
-    op materializes ``T`` as a Python ``int`` (e.g. via ``aten.size.default``,
-    which ``guard_int``s the SymInt), the compile-time value is baked into the
-    artifact. At runtime that either indexes out of bounds (``T`` smaller than
-    at compile time) or silently truncates three-body terms (``T`` larger),
-    producing wrong energies and forces.
-
-    This is the *second* of two defences, and it is normally unreachable:
-    while ``MATTERSIM_DYNAMIC_SHAPES`` declares this dim with the named
-    :data:`_THREEBODY_DIM`, ``torch.export`` itself raises
-    ``ConstraintViolationError`` first. It earns its keep if that spec is ever
-    weakened -- with ``Dim.AUTO`` (as originally shipped) export accepts the
-    specialization silently and this check is the only thing standing between
-    a frozen ``T`` and a corrupt artifact.
-
-    Args:
-        exported_model: The :class:`torch.export.ExportedProgram` to check.
-
-    Raises:
-        RuntimeError: If the ``three_body_indices`` leading dimension carries
-            no free symbols, i.e. it was pinned to a constant.
-    """
-    user_inputs = list(exported_model.graph_signature.user_inputs)
-    target = user_inputs[_THREEBODY_INPUT_INDEX]
-    node = next(
-        n
-        for n in exported_model.graph.nodes
-        if n.op == "placeholder" and n.name == target
-    )
-    dim0 = node.meta["val"].shape[0]
-    if not is_dynamic_dim(dim0):
-        raise RuntimeError(
-            "AOTI export specialized the three-body dimension of "
-            f"'three_body_indices' to the constant {dim0}. The compiled "
-            "artifact would be valid only for structures with exactly that "
-            "many angle terms and would silently return wrong energies and "
-            "forces otherwise. Some op in the model materializes the size of "
-            "a three-body-dimensioned tensor as a Python int; re-run the "
-            "export with TORCH_LOGS='+dynamic' and "
-            f"TORCHDYNAMO_EXTENDED_DEBUG_GUARD_ADDED='Eq(s?, {dim0})' to "
-            "locate it."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -375,19 +308,35 @@ def _get_example_inputs(
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
+def _model_fingerprint(m3gnet: M3Gnet) -> str:
+    """Return a stable digest of the model configuration and state."""
+    digest = hashlib.sha256()
+    model_args = json.dumps(m3gnet.model_args, sort_keys=True)
+    digest.update(model_args.encode())
+    for name, tensor in sorted(m3gnet.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(str(tuple(value.shape)).encode())
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _get_cache_path(
     version: str,
     device: str,
     settings: AOTISettings,
+    model_fingerprint: str,
 ) -> str:
     """Deterministic cache path for a compiled model."""
     cache_dir = Path.home() / ".cache" / "mattersim" / "aoti"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Include the torch and mattersim versions in the hash so that upgrades
-    # (which may change the traced graph) never reuse a stale artifact.
     outputs_tag = settings.outputs_tag
-    key = f"{version}_{device}_{outputs_tag}_{torch.__version__}_{__version__}"
-    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    key = (
+        f"{_AOTI_CACHE_ABI}_{version}_{device}_{outputs_tag}_"
+        f"{torch.__version__}_{__version__}_{model_fingerprint}"
+    )
+    h = hashlib.sha256(key.encode()).hexdigest()[:12]
     return str(cache_dir / f"mattersim_{version}_{device}_{outputs_tag}_{h}.pt2")
 
 
@@ -411,7 +360,12 @@ def compile_m3gnet_aoti(
     Returns:
         Path to the compiled .pt2 package.
     """
-    cache_path = _get_cache_path(version, device, settings=settings)
+    cache_path = _get_cache_path(
+        version,
+        device,
+        settings=settings,
+        model_fingerprint=_model_fingerprint(m3gnet),
+    )
     if os.path.exists(cache_path) and not settings.force_recompile:
         logger.info(f"AOTI compiled model found in cache: {cache_path}")
         return cache_path
@@ -429,9 +383,7 @@ def compile_m3gnet_aoti(
     wrapper.eval()
     wrapper.to(device)
 
-    example_inputs = _get_example_inputs(
-        cutoff, threebody_cutoff, torch.device(device)
-    )
+    example_inputs = _get_example_inputs(cutoff, threebody_cutoff, torch.device(device))
 
     # Validate eager model first
     logger.info("Validating eager model outputs...")
@@ -448,9 +400,6 @@ def compile_m3gnet_aoti(
         example_inputs,
         dynamic_shapes=MATTERSIM_DYNAMIC_SHAPES,
     )
-    # Backstop: the named _THREEBODY_DIM above normally makes export itself
-    # raise on specialization, so this only fires if that spec is weakened.
-    assert_threebody_dim_is_dynamic(exported_model)
 
     logger.info("AOTI compiling and packaging...")
     torch._inductor.aoti_compile_and_package(
@@ -553,8 +502,7 @@ class AOTIModelWrapper(nn.Module):
     def enable_gradient_checkpointing(self, enable: bool = True) -> None:
         if enable:
             logger.warning(
-                "Gradient checkpointing is not supported for "
-                "AOTI-compiled models."
+                "Gradient checkpointing is not supported for " "AOTI-compiled models."
             )
 
 

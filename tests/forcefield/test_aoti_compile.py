@@ -280,14 +280,15 @@ def test_mps_model_stage_diagnostics(si_diamond, perturb):
     )
     three_basis = model.sbf(rik, torch.acos(cos_jik))
     interaction = model.graph_conv[0].three_body
+    edge_length_column = edge_length.unsqueeze(-1)
     atom_mask = (
         interaction.atom_mlp(atom_attr)[edge_index[0][three_body_indices[:, 1]]]
         * polynomial(
-            edge_length[three_body_indices[:, 0]],
+            edge_length_column[three_body_indices[:, 0]],
             interaction.threebody_cutoff,
         )
         * polynomial(
-            edge_length[three_body_indices[:, 1]],
+            edge_length_column[three_body_indices[:, 1]],
             interaction.threebody_cutoff,
         )
     )
